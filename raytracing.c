@@ -1,18 +1,21 @@
 #include <stdio.h>
 #include <stdlib.h>
-
+#include <pthread.h>
+#include <errno.h>
 #include "math-toolkit.h"
 #include "primitives.h"
 #include "raytracing.h"
 #include "idx_stack.h"
-
+#include "time.h"
 #define MAX_REFLECTION_BOUNCES	3
 #define MAX_DISTANCE 1000000000000.0
 #define MIN_DISTANCE 0.00001
 #define SAMPLES 4
-
+#define OUT_EXEC_TIME "exec_time.txt"
 #define SQUARE(x) (x * x)
 #define MAX(a, b) (a > b ? a : b)
+
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
 
 /* @param t t distance
  * @return 1 means hit, otherwise 0
@@ -126,6 +129,18 @@ static int rayRectangularIntersection(const point3 ray_e,
     return 1;
 }
 
+static unsigned long diff_in_usecond(struct timespec t1, struct timespec t2)
+{
+    struct timespec diff;
+    if (t2.tv_nsec-t1.tv_nsec < 0) {
+        diff.tv_sec  = t2.tv_sec - t1.tv_sec - 1;
+        diff.tv_nsec = t2.tv_nsec - t1.tv_nsec + 1000000000;
+    } else {
+        diff.tv_sec  = t2.tv_sec - t1.tv_sec;
+        diff.tv_nsec = t2.tv_nsec - t1.tv_nsec;
+    }
+    return (diff.tv_sec*1000000 + diff.tv_nsec/1000);
+}
 static void localColor(color local_color,
                        const color light_color, double diffuse,
                        double specular, const object_fill *fill)
@@ -452,47 +467,107 @@ static unsigned int ray_color(const point3 e, double t,
     return 1;
 }
 
+
+void *ray_pixel(void *param)
+{
+    thread_param_t *info = (thread_param_t *)param;
+    point3 d;
+    color obj_color = {0.0, 0.0, 0.0};
+    idx_stack stk;
+    double r = 0, g = 0, b = 0;
+    int hIdx = 0, wIdx = 0;
+
+    while (1) {
+        pthread_mutex_lock(&mtx);
+
+        info->total_num++;
+        info->w_idx++;
+        if (info->w_idx >= info->width) {
+            info->h_idx++;
+            info->w_idx = 0;
+        }
+
+        hIdx = info->h_idx;
+        wIdx = info->w_idx;
+        pthread_mutex_unlock(&mtx);
+
+        if (info->h_idx >= info->height) {
+            break;
+        }
+
+        r = 0, g = 0, b = 0;
+
+        for (int s = 0; s < SAMPLES; s++) {
+            idx_stack_init(&stk);
+            rayConstruction(d, info->u, info->v, info->w,
+                            wIdx * info->factor + s / info->factor,
+                            hIdx * info->factor + s % info->factor,
+                            info->view,
+                            info->width * info->factor, info->height * info->factor);
+            if (ray_color(info->view->vrp, 0.0, d, &stk,
+                          *(info->p_rectangulars),
+                          *(info->p_spheres),
+                          *(info->p_lights), obj_color,
+                          MAX_REFLECTION_BOUNCES)) {
+                r += obj_color[0];
+                g += obj_color[1];
+                b += obj_color[2];
+            } else {
+                r += info->bg_color[0];
+                g += info->bg_color[1];
+                b += info->bg_color[2];
+            }
+        }
+        info->pixels[((wIdx + (hIdx * info->width)) * 3) + 0] = r*255/SAMPLES;
+        info->pixels[((wIdx + (hIdx * info->width)) * 3) + 1] = g*255/SAMPLES;
+        info->pixels[((wIdx + (hIdx * info->width)) * 3) + 2] = b*255/SAMPLES;
+    }
+    pthread_exit(NULL);
+}
+
+
+
 /* @param background_color this is not ambient light */
 void raytracing(uint8_t *pixels, color background_color,
                 rectangular_node rectangulars, sphere_node spheres,
                 light_node lights, const viewpoint *view,
                 int width, int height)
 {
-    point3 u, v, w, d;
-    color object_color = { 0.0, 0.0, 0.0 };
+    pthread_t t1, t2, t3, t4;
 
-    /* calculate u, v, w */
-    calculateBasisVectors(u, v, w, view);
+    thread_param_t thread_info = {
+        .w_idx = -1,
+        .h_idx = 0,
+        .view = view,
+        .p_spheres = &spheres,
+        .p_rectangulars = &rectangulars,
+        .p_lights = &lights,
+        .width = width,
+        .height = height,
+        .pixels = pixels
+    };
+    calculateBasisVectors(thread_info.u, thread_info.v, thread_info.w, view);
 
-    idx_stack stk;
-
-    int factor = sqrt(SAMPLES);
-    for (int j = 0; j < height; j++) {
-        for (int i = 0; i < width; i++) {
-            double r = 0, g = 0, b = 0;
-            /* MSAA */
-            for (int s = 0; s < SAMPLES; s++) {
-                idx_stack_init(&stk);
-                rayConstruction(d, u, v, w,
-                                i * factor + s / factor,
-                                j * factor + s % factor,
-                                view,
-                                width * factor, height * factor);
-                if (ray_color(view->vrp, 0.0, d, &stk, rectangulars, spheres,
-                              lights, object_color,
-                              MAX_REFLECTION_BOUNCES)) {
-                    r += object_color[0];
-                    g += object_color[1];
-                    b += object_color[2];
-                } else {
-                    r += background_color[0];
-                    g += background_color[1];
-                    b += background_color[2];
-                }
-                pixels[((i + (j * width)) * 3) + 0] = r * 255 / SAMPLES;
-                pixels[((i + (j * width)) * 3) + 1] = g * 255 / SAMPLES;
-                pixels[((i + (j * width)) * 3) + 2] = b * 255 / SAMPLES;
-            }
-        }
+    thread_info.bg_color[0] = background_color[0];
+    thread_info.bg_color[1] = background_color[1];
+    thread_info.bg_color[2] = background_color[2];
+    thread_info.factor = sqrt(SAMPLES);
+    if (pthread_create (&t1, NULL, ray_pixel, (void *)&thread_info) !=0) {
+        perror("thread creation fail:t1");
     }
+    if (pthread_create (&t2, NULL, ray_pixel, (void *)&thread_info) !=0) {
+        perror("thread creation fail:t2");
+    }
+    if (pthread_create (&t3, NULL, ray_pixel, (void *)&thread_info) !=0) {
+        perror("thread creation fail:t3");
+    }
+
+    if (pthread_create (&t4, NULL, ray_pixel, (void *)&thread_info) !=0) {
+        perror("thread creation fail:t4");
+    }
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    pthread_join(t1, NULL);
+
 }
