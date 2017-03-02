@@ -11,6 +11,13 @@
 #define ROWS 512
 #define COLS 512
 
+
+#ifdef MULTI_THREAD_CYCLE_PARTITION
+#define RECORD_FILE "multithread_cycle_partition.txt"
+#else
+#define RECORD_FILE "multithread_in_turn.txt"
+#endif
+
 static void write_to_ppm(FILE *outfile, uint8_t *pixels,
                          int width, int height)
 {
@@ -39,7 +46,6 @@ int main()
     sphere_node spheres = NULL;
     color background = { 0.0, 0.1, 0.1 };
     struct timespec start, end;
-
 #include "use-models.h"
 
     /* allocate by the given resolution */
@@ -58,6 +64,12 @@ int main()
         fclose(outfile);
     }
 
+    {
+
+        FILE *time_record = fopen(RECORD_FILE, "a");
+        fprintf(time_record, "%lf\n", diff_in_second(start, end));
+        fclose(time_record);
+    }
     delete_rectangular_list(&rectangulars);
     delete_sphere_list(&spheres);
     delete_light_list(&lights);
